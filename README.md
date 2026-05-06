@@ -1,14 +1,13 @@
 # RHEL-Super-Updater
 
-**Version:** 3.3
-**Target:** Fedora 44 (DNF 5)
+**Target:** DNF 5
 **Type:** Fully non-interactive system updater and cleaner
 
 ---
 
 ## Overview
 
-`updater` is a Bash script designed to **update, clean, and audit** a Fedora-based system in a single run.
+This is a Bash script designed to **update, clean, and audit** a Fedora-based system in a single run.
 
 It executes a structured pipeline covering:
 
