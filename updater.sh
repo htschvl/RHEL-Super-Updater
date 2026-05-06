@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# updater — Updates and trims the system (DNF, Firmware, Flatpak, Snap, GNOME)
-# Version 3.3 — target: Fedora 44 with DNF 5
+# RHEL Super Updater — Updates and trims the system (DNF, Firmware, Flatpak, Snap, GNOME)
+# Target: Fedora/RHEL with DNF 5
 # Fully non-interactive: --assumeyes on every command that could prompt.
 
 set -uo pipefail
 
+# Force English output from system tools (DNF, Flatpak, fwupd, etc.)
+export LC_ALL=C.UTF-8
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 readonly ACTION="${1:-}"
-readonly SCRIPT_VERSION="3.3"
 
 # Timeouts (seconds). 0 = no timeout.
 readonly TIMEOUT_FWUPD=600
@@ -19,9 +23,6 @@ readonly TIMEOUT_GEXT=300
 # Journal retention
 readonly JOURNAL_RETAIN_DAYS=14
 readonly JOURNAL_MAX_SIZE="500M"
-
-# How many items to show in inspection listings
-readonly INSPECT_LIMIT=20
 
 # ─── Colors and icons ────────────────────────────────────────────────────────
 
@@ -53,24 +54,25 @@ readonly ICON_SNAP="🔩"
 readonly ICON_GNOME="🧩"
 readonly ICON_FW="⚡"
 readonly ICON_JOURNAL="📰"
-readonly ICON_INSPECT="🔍"
+readonly ICON_BLOAT="🔍"
 
 readonly LINE_THICK="══════════════════════════════════════════════════════════════"
 readonly LINE_THIN="──────────────────────────────────────────────────────────────"
 
 # ─── Step pipeline (icon|label|function) ─────────────────────────────────────
+# Order: install/update first, then trim, then journal vacuum (last before summary)
 
 readonly STEPS=(
   "${ICON_CLEAN}|Cleaning DNF cache|step_dnf_clean"
   "${ICON_CACHE}|Rebuilding metadata|step_dnf_makecache"
-  "${ICON_SYNC}|Syncing packages (distro-sync + upgrade)|step_dnf_distrosync"
-  "${ICON_ORPHAN}|Removing orphan packages (autoremove)|step_dnf_autoremove"
-  "${ICON_FW}|Updating firmware (fwupd)|step_firmware"
-  "${ICON_FLATPAK}|Updating and cleaning Flatpaks|step_flatpak"
+  "${ICON_SYNC}|Syncing packages|step_dnf_distrosync"
+  "${ICON_ORPHAN}|Removing orphans|step_dnf_autoremove"
+  "${ICON_FW}|Updating firmware|step_firmware"
+  "${ICON_FLATPAK}|Updating Flatpaks|step_flatpak"
   "${ICON_SNAP}|Updating Snaps|step_snap"
   "${ICON_GNOME}|Updating GNOME extensions|step_gnome_extensions"
+  "${ICON_BLOAT}|Removing bloat|step_remove_bloat"
   "${ICON_JOURNAL}|Cleaning old journal|step_journal_vacuum"
-  "${ICON_INSPECT}|Bloat inspection (informational)|step_inspect_bloat"
 )
 
 readonly TOTAL_STEPS=${#STEPS[@]}
@@ -109,7 +111,7 @@ log_substep() { printf "    ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}%s${C_RES
 
 log_step_header() {
   local icon="$1" label="$2" step="$3"
-  printf "\033]0;updater — [%d/%d] %s\007" "$step" "$TOTAL_STEPS" "$label"
+  printf "\033]0;RHEL Super Updater — [%d/%d] %s\007" "$step" "$TOTAL_STEPS" "$label"
   printf "\n${C_MAGENTA}${LINE_THIN}${C_RESET}\n"
   printf "  %s  ${C_WHITE}[%d/%d]${C_RESET}  ${C_BOLD}%s${C_RESET}\n" \
     "$icon" "$step" "$TOTAL_STEPS" "$label"
@@ -173,13 +175,13 @@ record_step() {
 
 show_help() {
   printf "\n${C_WHITE}${LINE_THICK}${C_RESET}\n"
-  printf "\n  ${C_BOLD}${ICON_ROCKET}  updater${C_RESET} v${SCRIPT_VERSION} — System updater and cleaner\n"
+  printf "\n  ${C_BOLD}${ICON_ROCKET}  RHEL Super Updater${C_RESET} — System updater and cleaner\n"
   printf "\n${C_CYAN}  Usage:${C_RESET}\n"
   printf "    sudo %s ${C_WHITE}{shutdown|reboot|keepon|--help}${C_RESET}\n\n" "$(basename "$0")"
   printf "${C_CYAN}  Pipeline:${C_RESET}\n"
-  printf "    DNF (clean → makecache → distro-sync + upgrade → autoremove)\n"
-  printf "    Firmware (fwupd) → Flatpak (system + user, prune) → Snap → GNOME ext.\n"
-  printf "    Journal vacuum → Bloat inspection\n\n"
+  printf "    DNF clean → metadata → sync → orphans\n"
+  printf "    Firmware → Flatpak → Snap → GNOME extensions\n"
+  printf "    Remove bloat → Journal vacuum\n\n"
   printf "${C_CYAN}  Actions:${C_RESET}\n"
   printf "    ${C_WHITE}shutdown${C_RESET}   Power off after updates\n"
   printf "    ${C_WHITE}reboot${C_RESET}     Reboot after updates\n"
@@ -225,21 +227,37 @@ validate_dependencies() {
 # ─── Header with system info and sources ─────────────────────────────────────
 
 show_header() {
-  local distro kernel hostname uptime_str dnf_ver repo_count
+  local distro kernel uptime_str dnf_ver repo_count
 
   distro=$(. /etc/os-release && echo "$PRETTY_NAME" 2>/dev/null || echo "Linux")
   kernel=$(uname -r)
-  hostname=$(hostnamectl --static 2>/dev/null || hostname)
   uptime_str=$(uptime -p 2>/dev/null | sed 's/up //' || echo "?")
   dnf_ver=$(dnf --version 2>/dev/null | head -1 || echo "?")
   repo_count=$(dnf repolist --enabled 2>/dev/null | tail -n +2 | wc -l)
 
+  # ASCII art title
   printf "\n${C_WHITE}${LINE_THICK}${C_RESET}\n"
-  printf "  ${ICON_ROCKET}  ${C_BOLD}System Updater${C_RESET} ${C_DIM}v${SCRIPT_VERSION}${C_RESET}\n"
+  printf "${C_BOLD}${C_CYAN}"
+  cat <<'TITLE_EOF'
+
+                       ___ _  _ ___ _    
+                      | _ \ || | __| |   
+                      |   / __ | _|| |__ 
+                      |_|_\_||_|___|____|
+
+     ___                      _   _          _      _           
+    / __|_  _ _ __  ___ _ _  | | | |_ __  __| |__ _| |_ ___ _ _ 
+    \__ \ || | '_ \/ -_) '_| | |_| | '_ \/ _` / _` |  _/ -_) '_|
+    |___/\_,_| .__/\___|_|    \___/| .__/\__,_\__,_|\__\___|_|  
+             |_|                   |_|                          
+
+TITLE_EOF
+  printf "${C_RESET}"
   printf "${C_WHITE}${LINE_THICK}${C_RESET}\n"
+
+  # System info
   printf "  ${C_DIM}Distro      :${C_RESET}  %s\n" "$distro"
   printf "  ${C_DIM}Kernel      :${C_RESET}  %s\n" "$kernel"
-  printf "  ${C_DIM}Hostname    :${C_RESET}  %s\n" "$hostname"
   printf "  ${C_DIM}Uptime      :${C_RESET}  %s\n" "$uptime_str"
   printf "  ${C_DIM}DNF         :${C_RESET}  %s\n" "$dnf_ver"
   printf "  ${C_DIM}DNF repos   :${C_RESET}  %d active\n" "$repo_count"
@@ -269,36 +287,22 @@ step_dnf_distrosync() {
   # distro-sync aligns with active repos (including downgrades); upgrade picks
   # up anything distro-sync left behind because it wasn't reconciling.
   local rc=0
-  run_subcmd "dnf distro-sync --refresh --best" 0 \
+  run_subcmd "distro-sync" 0 \
     dnf distro-sync --refresh --best --assumeyes || rc=$?
-  run_subcmd "dnf upgrade --refresh --best (safety pass)" 0 \
+  run_subcmd "upgrade" 0 \
     dnf upgrade --refresh --best --assumeyes || rc=$?
   return "$rc"
 }
 
 step_dnf_autoremove() {
-  # Runs several informational listings + final autoremove.
-  # Each subcommand reports success/failure individually.
   local rc=0
 
-  run_subcmd "dnf repoquery --extras (installed but not in any active repo)" 0 \
-    dnf repoquery --extras || rc=$?
-
-  run_subcmd "dnf repoquery --unneeded (autoremove candidates)" 0 \
-    dnf repoquery --unneeded || rc=$?
-
   if command -v package-cleanup &>/dev/null; then
-    run_subcmd "package-cleanup --orphans" 0 \
+    run_subcmd "orphans" 0 \
       package-cleanup --orphans || rc=$?
-    run_subcmd "package-cleanup --leaves" 0 \
-      package-cleanup --leaves || rc=$?
-  else
-    log_warn "package-cleanup not available — skipping."
-    log_dim "    To install:  sudo dnf install dnf-plugins-core"
-    printf "\n"
   fi
 
-  run_subcmd "dnf autoremove (actual removal)" 0 \
+  run_subcmd "autoremove" 0 \
     dnf autoremove --assumeyes || rc=$?
 
   return "$rc"
@@ -315,7 +319,7 @@ step_firmware() {
 
   local rc=0
 
-  log_substep "fwupdmgr refresh (LVFS metadata)"
+  log_substep "refresh"
   printf "\n"
   run_cmd "$TIMEOUT_FWUPD" fwupdmgr refresh --force \
     && log_success "LVFS metadata refreshed" \
@@ -323,7 +327,7 @@ step_firmware() {
   printf "\n"
 
   # `get-updates` returns 2 when there's nothing — not an error
-  log_substep "fwupdmgr get-updates"
+  log_substep "get-updates"
   printf "\n"
   local fw_exit=0
   fwupdmgr get-updates || fw_exit=$?
@@ -334,7 +338,7 @@ step_firmware() {
     return 0
   fi
 
-  run_subcmd "fwupdmgr update (apply firmware)" "$TIMEOUT_FWUPD" \
+  run_subcmd "update" "$TIMEOUT_FWUPD" \
     fwupdmgr update --assume-yes --no-reboot-check || rc=$?
 
   return "$rc"
@@ -351,18 +355,18 @@ step_flatpak() {
   local rc=0
 
   # 1. System-wide (root): /var/lib/flatpak
-  run_subcmd "flatpak update --system (system-wide install)" "$TIMEOUT_FLATPAK" \
+  run_subcmd "system update" "$TIMEOUT_FLATPAK" \
     flatpak update --assumeyes --noninteractive --system || rc=$?
 
-  run_subcmd "flatpak uninstall --unused --system (prune system)" "$TIMEOUT_FLATPAK" \
+  run_subcmd "system prune" "$TIMEOUT_FLATPAK" \
     flatpak uninstall --unused --assumeyes --noninteractive --system || rc=$?
 
   # 2. Per-user (from SUDO_USER, not root): ~/.local/share/flatpak
   if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-    run_subcmd "flatpak update --user (per-user install for ${SUDO_USER})" "$TIMEOUT_FLATPAK" \
+    run_subcmd "user update" "$TIMEOUT_FLATPAK" \
       runuser -l "$SUDO_USER" -c 'flatpak update --assumeyes --noninteractive --user' || rc=$?
 
-    run_subcmd "flatpak uninstall --unused --user (prune user)" "$TIMEOUT_FLATPAK" \
+    run_subcmd "user prune" "$TIMEOUT_FLATPAK" \
       runuser -l "$SUDO_USER" -c 'flatpak uninstall --unused --assumeyes --noninteractive --user' || rc=$?
   else
     log_warn "SUDO_USER not set or is root — skipping per-user update."
@@ -447,6 +451,127 @@ step_gnome_extensions() {
   return 0
 }
 
+# ─── Step: Remove bloat (ACTIVE — actually removes/fixes) ────────────────────
+# Categories handled (only shown when present):
+#   1. Duplicates    — removed via dnf remove --duplicates
+#   2. Old kernels   — removed via dnf remove --oldinstallonly (respects installonly_limit)
+#   3. RPMDB issues  — fixed via rpm --rebuilddb (handles ghost references)
+#   4. Leaves        — only removed when reason="Dependency" (never user-installed)
+#   5. Final autoremove pass to catch anything orphaned by the above
+#
+# Deliberately NOT touched:
+#   - Extras (dnf repoquery --extras): would delete manually-installed RPMs
+#   - User-installed leaves: same risk
+#   - Packages with reason="unknown" (legacy from pre-DNF5 systems)
+
+step_remove_bloat() {
+  local rc=0
+  local found_any=0
+
+  # 1. Duplicates ─────────────────────────────────────────────────────────────
+  local duplicates
+  duplicates=$(dnf repoquery --duplicates -q 2>/dev/null)
+  if [[ -n "$duplicates" ]]; then
+    found_any=1
+    log_substep "duplicates"
+    printf "\n"
+    echo "$duplicates" | sed 's/^/      /'
+    printf "\n"
+    log_info "Removing..."
+    printf "\n"
+    run_cmd 0 dnf remove --duplicates --assumeyes || rc=$?
+    printf "\n"
+  fi
+
+  # 2. Old kernels ────────────────────────────────────────────────────────────
+  local limit kernel_count
+  limit=$(awk -F= '/^[[:space:]]*installonly_limit/{gsub(/[[:space:]]/,"",$2); print $2; exit}' \
+    /etc/dnf/dnf.conf 2>/dev/null)
+  limit=${limit:-3}
+  kernel_count=$(dnf repoquery --installed kernel-core -q 2>/dev/null | wc -l)
+  if [[ "$kernel_count" -gt "$limit" ]]; then
+    found_any=1
+    log_substep "old kernels"
+    printf "\n"
+    log_dim "  Installed: ${kernel_count} (limit: ${limit})"
+    dnf repoquery --installed kernel-core -q 2>/dev/null | sed 's/^/      /'
+    printf "\n"
+    log_info "Removing..."
+    printf "\n"
+    run_cmd 0 dnf remove --oldinstallonly --assumeyes || rc=$?
+    printf "\n"
+  fi
+
+  # 3. RPMDB integrity ────────────────────────────────────────────────────────
+  local check_output check_exit=0
+  check_output=$(dnf check 2>&1) || check_exit=$?
+  if [[ "$check_exit" -ne 0 ]]; then
+    found_any=1
+    log_substep "rpmdb"
+    printf "\n"
+    echo "$check_output" | head -n 30 | sed 's/^/      /'
+    printf "\n"
+    log_info "Rebuilding RPMDB..."
+    printf "\n"
+    run_cmd 0 rpm --rebuilddb || rc=$?
+    printf "\n"
+  fi
+
+  # 4. Leaves (only those with reason="Dependency" — never user-installed) ───
+  if command -v package-cleanup &>/dev/null; then
+    local all_leaves dep_leaves="" reasons_map
+    all_leaves=$(package-cleanup --leaves --quiet 2>/dev/null)
+    if [[ -n "$all_leaves" ]]; then
+      # Pull all installed packages with their reasons in one DNF call (fast)
+      reasons_map=$(dnf repoquery --installed --queryformat '%{name}|%{reason}\n' --quiet 2>/dev/null)
+      while IFS= read -r leaf; do
+        [[ -z "$leaf" ]] && continue
+        # Strip arch suffix: "htop.x86_64" → "htop"
+        local pkg_name="${leaf%.*}"
+        # Keep only leaves whose install reason is exactly "Dependency"
+        # (excludes User, Group, Weak, and unknown — all of which are unsafe to auto-remove)
+        if grep -qxF "${pkg_name}|Dependency" <<< "$reasons_map"; then
+          dep_leaves+="${pkg_name}"$'\n'
+        fi
+      done <<< "$all_leaves"
+
+      if [[ -n "$dep_leaves" ]]; then
+        found_any=1
+        log_substep "leaves"
+        printf "\n"
+        printf '%s' "$dep_leaves" | sed 's/^/      /'
+        printf "\n"
+        log_info "Removing..."
+        printf "\n"
+        printf '%s' "$dep_leaves" | xargs -r dnf remove --assumeyes || rc=$?
+        printf "\n"
+      fi
+    fi
+  fi
+
+  # 5. Final autoremove pass ──────────────────────────────────────────────────
+  # Catches anything orphaned by the removals above
+  local unneeded
+  unneeded=$(dnf repoquery --unneeded -q 2>/dev/null)
+  if [[ -n "$unneeded" ]]; then
+    found_any=1
+    log_substep "autoremove"
+    printf "\n"
+    echo "$unneeded" | sed 's/^/      /'
+    printf "\n"
+    log_info "Removing..."
+    printf "\n"
+    run_cmd 0 dnf autoremove --assumeyes || rc=$?
+    printf "\n"
+  fi
+
+  if [[ "$found_any" -eq 0 ]]; then
+    log_success "No bloat found. ✨"
+  fi
+
+  return "$rc"
+}
+
 # ─── Step: Journal vacuum ────────────────────────────────────────────────────
 
 step_journal_vacuum() {
@@ -466,124 +591,6 @@ step_journal_vacuum() {
 
   size_after=$(journalctl --disk-usage 2>/dev/null | grep -oP '\S+[A-Z]+' | head -1 || echo "?")
   log_dim "Size after: ${size_after}"
-}
-
-# ─── Step: Bloat inspection (informational, removes nothing) ─────────────────
-
-step_inspect_bloat() {
-  printf "\n"
-  log_info "This step is ${C_BOLD}informational${C_RESET}. Nothing will be removed automatically."
-  log_info "Review the lists and manually remove what you recognize as useless."
-  printf "\n"
-
-  # 1. Unneeded packages
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Unneeded packages${C_RESET} ${C_DIM}(dnf repoquery --unneeded)${C_RESET}\n"
-  local unneeded
-  unneeded=$(dnf repoquery --unneeded -q 2>/dev/null | head -n "$INSPECT_LIMIT")
-  if [[ -z "$unneeded" ]]; then
-    log_dim "  None. ✨"
-  else
-    echo "$unneeded" | sed 's/^/      /'
-    local total
-    total=$(dnf repoquery --unneeded -q 2>/dev/null | wc -l)
-    [[ "$total" -gt "$INSPECT_LIMIT" ]] && log_dim "  ... (${total} total)"
-    log_dim "  To remove: sudo dnf remove <name>"
-  fi
-  printf "\n"
-
-  # 2. "Extra" packages — installed but not in any enabled repo
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Extra packages${C_RESET} ${C_DIM}(dnf repoquery --extras — not in any active repo)${C_RESET}\n"
-  local extras
-  extras=$(dnf repoquery --extras -q 2>/dev/null | head -n "$INSPECT_LIMIT")
-  if [[ -z "$extras" ]]; then
-    log_dim "  None. ✨"
-  else
-    echo "$extras" | sed 's/^/      /'
-    local total
-    total=$(dnf repoquery --extras -q 2>/dev/null | wc -l)
-    [[ "$total" -gt "$INSPECT_LIMIT" ]] && log_dim "  ... (${total} total)"
-    log_warn "  Caveat: may include packages from repos you've temporarily disabled."
-  fi
-  printf "\n"
-
-  # 3. Duplicate packages (DNF 5 supports this natively)
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Duplicate packages${C_RESET} ${C_DIM}(dnf repoquery --duplicates — multiple versions installed)${C_RESET}\n"
-  local duplicates
-  duplicates=$(dnf repoquery --duplicates -q 2>/dev/null | head -n "$INSPECT_LIMIT")
-  if [[ -z "$duplicates" ]]; then
-    log_dim "  None. ✨"
-  else
-    echo "$duplicates" | sed 's/^/      /'
-    log_dim "  To clean: sudo dnf remove --duplicates"
-  fi
-  printf "\n"
-
-  # 4. Top-N user-installed packages by size — raw list from DNF 5
-  # Note: in DNF 5, --userinstalled returns packages with reason "User" AND "unknown"
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Top ${INSPECT_LIMIT} user-installed packages by size${C_RESET} ${C_DIM}(raw list, includes 'unknown reason' on DNF 5)${C_RESET}\n"
-  local user_pkgs
-  user_pkgs=$(dnf repoquery --userinstalled --queryformat '%{size}\t%{name}\n' -q 2>/dev/null \
-    | sort -rn \
-    | head -n "$INSPECT_LIMIT" \
-    | awk '{
-        size=$1; name=$2;
-        if (size >= 1073741824) printf "      %7.1f GB  %s\n", size/1073741824, name;
-        else if (size >= 1048576) printf "      %7.1f MB  %s\n", size/1048576, name;
-        else printf "      %7.1f KB  %s\n", size/1024, name;
-      }')
-  if [[ -z "$user_pkgs" ]]; then
-    log_dim "  (could not list)"
-  else
-    echo "$user_pkgs"
-  fi
-  printf "\n"
-
-  # 5. Filtered to only reason=User explicit (workaround for the DNF 5 gotcha)
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Top ${INSPECT_LIMIT} with explicit reason='User'${C_RESET} ${C_DIM}(filtered, more accurate)${C_RESET}\n"
-  local user_pkgs_filtered
-  user_pkgs_filtered=$(dnf repoquery --userinstalled --queryformat '%{name}|%{reason}|%{size}\n' -q 2>/dev/null \
-    | awk -F'|' '$2 == "User" { print $3 "\t" $1 }' \
-    | sort -rn \
-    | head -n "$INSPECT_LIMIT" \
-    | awk '{
-        size=$1; name=$2;
-        if (size >= 1073741824) printf "      %7.1f GB  %s\n", size/1073741824, name;
-        else if (size >= 1048576) printf "      %7.1f MB  %s\n", size/1048576, name;
-        else printf "      %7.1f KB  %s\n", size/1024, name;
-      }')
-  if [[ -z "$user_pkgs_filtered" ]]; then
-    log_dim "  (empty — on systems upgraded from F40, this is expected: reasons marked as 'unknown')"
-  else
-    echo "$user_pkgs_filtered"
-  fi
-  printf "\n"
-
-  # 6. Bonus: package-cleanup --leaves if available
-  if command -v package-cleanup &>/dev/null; then
-    printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Leaf packages${C_RESET} ${C_DIM}(package-cleanup --leaves — first ${INSPECT_LIMIT})${C_RESET}\n"
-    package-cleanup --leaves --quiet 2>/dev/null | head -n "$INSPECT_LIMIT" | sed 's/^/      /'
-    printf "\n"
-  fi
-
-  # 7. RPMDB integrity (read-only, modifies nothing)
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}RPMDB integrity${C_RESET} ${C_DIM}(dnf check)${C_RESET}\n"
-  local check_output check_exit=0
-  check_output=$(dnf check 2>&1) || check_exit=$?
-  if [[ "$check_exit" -eq 0 ]]; then
-    log_dim "  RPMDB intact. ✨"
-  else
-    echo "$check_output" | head -n 30 | sed 's/^/      /'
-    log_warn "  RPMDB issues detected (rc=${check_exit}). Review manually."
-  fi
-  printf "\n"
-
-  # 8. Old kernels
-  local kernel_count
-  kernel_count=$(dnf repoquery --installed kernel-core -q 2>/dev/null | wc -l)
-  printf "  ${C_BLUE}${ICON_ARROW}${C_RESET}  ${C_BOLD}Installed kernels:${C_RESET} %d ${C_DIM}(installonly_limit in /etc/dnf/dnf.conf)${C_RESET}\n" "$kernel_count"
-  printf "\n"
-
-  return 0
 }
 
 # ─── Main execution loop ─────────────────────────────────────────────────────
