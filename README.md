@@ -200,4 +200,4 @@ sudo updater keepon
 
 ## 📝 License
 
-Add your preferred license here.
+GNU General Public License 3.0
